@@ -190,13 +190,38 @@ def main():
     else:
         start_dt, end_dt = min_date, max_date
     
-    filtered_subs = subscribers[
+    # Initial filter based on static attributes
+    filtered_subs_initial = subscribers[
         (subscribers['city'].isin(cities)) &
         (subscribers['plan_type'].isin(plan_types)) &
         (subscribers['plan_name'].isin(plan_names)) &
         (subscribers['status'].isin(sub_status))
     ]
     
+    # Get all subscriber IDs that have activity during the selected date range
+    # This includes billing, ticket, and outage-related activities
+    billing_sub_ids = set(billing[
+        (billing['subscriber_id'].isin(filtered_subs_initial['subscriber_id'])) &
+        (billing['billing_month'] >= start_dt) &
+        (billing['billing_month'] <= end_dt)
+    ]['subscriber_id'].unique())
+    
+    ticket_sub_ids = set(tickets[
+        (tickets['subscriber_id'].isin(filtered_subs_initial['subscriber_id'])) &
+        (tickets['ticket_date'] >= start_dt) &
+        (tickets['ticket_date'] <= end_dt)
+    ]['subscriber_id'].unique())
+    
+    # Combine all active subscriber IDs during the date range
+    active_sub_ids = billing_sub_ids.union(ticket_sub_ids)
+    
+    # If no date-filtered activity, fall back to initial filter
+    if len(active_sub_ids) > 0:
+        filtered_subs = filtered_subs_initial[filtered_subs_initial['subscriber_id'].isin(active_sub_ids)].copy()
+    else:
+        filtered_subs = filtered_subs_initial.copy()
+    
+    # Now filter the related data based on the final filtered subscribers
     filtered_billing = billing[
         (billing['subscriber_id'].isin(filtered_subs['subscriber_id'])) &
         (billing['billing_month'] >= start_dt) &
@@ -227,7 +252,10 @@ def main():
         arpu = total_revenue / active_count if active_count > 0 else 0
         
         # Retention ratio (simplified as active vs total)
-        retention_ratio = (active_count / len(filtered_subs) * 100) if len(filtered_subs) > 0 else 0
+        # Calculate retention ratio based on active subscribers in the filtered data
+        total_filtered_subs = len(filtered_subs)
+        active_filtered_subs = len(filtered_subs[filtered_subs['status'] == 'Active'])
+        retention_ratio = (active_filtered_subs / total_filtered_subs * 100) if total_filtered_subs > 0 else 0
         
         overdue_revenue = filtered_billing[filtered_billing['payment_status'] == 'Overdue']['bill_amount'].sum()
         
@@ -256,9 +284,16 @@ def main():
             monthly_subs = filtered_subs[filtered_subs['status'] == 'Active'].shape[0]
             monthly_arpu = monthly_rev / monthly_subs if monthly_subs > 0 else monthly_rev * 0
             
+            # Create a DataFrame for the ARPU data
+            arpu_df = pd.DataFrame({
+                'month': monthly_arpu.index,
+                'arpu': monthly_arpu.values
+            })
+            
             fig1 = px.line(
-                x=monthly_arpu.index,
-                y=monthly_arpu.values,
+                arpu_df,
+                x='month',
+                y='arpu',
                 title="Monthly ARPU Trend",
                 labels={'x': 'Month', 'y': 'ARPU (AED)'}
             )
@@ -310,9 +345,16 @@ def main():
                 on='subscriber_id'
             ).groupby('city')['bill_amount'].sum().sort_values(ascending=True)
             
+            # Create a DataFrame for the city revenue data
+            city_rev_df = pd.DataFrame({
+                'revenue': city_rev.values,
+                'city': city_rev.index
+            })
+            
             fig3 = px.bar(
-                x=city_rev.values,
-                y=city_rev.index,
+                city_rev_df,
+                x='revenue',
+                y='city',
                 orientation='h',
                 title="Revenue by City",
                 labels={'x': 'Revenue (AED)', 'y': 'City'}
@@ -411,7 +453,28 @@ def main():
         
         with col1:
             # Daily Ticket Volume Trend
-            daily_tickets = filtered_tickets.groupby('ticket_date').size().reset_index(name='count')
+            
+            # Add date filter controls for this specific chart
+            st.markdown("**Filter by Date Range for this Chart:**")
+            chart_date_range = st.date_input(
+                "Select Date Range for Ticket Volume", 
+                value=(filtered_tickets['ticket_date'].min().date(), filtered_tickets['ticket_date'].max().date()),
+                min_value=filtered_tickets['ticket_date'].min().date(),
+                max_value=filtered_tickets['ticket_date'].max().date(),
+                key="chart_date_range"
+            )
+            
+            # Filter data based on the chart-specific date range
+            if len(chart_date_range) == 2:
+                chart_start_date, chart_end_date = chart_date_range
+                chart_filtered_tickets = filtered_tickets[
+                    (filtered_tickets['ticket_date'] >= pd.to_datetime(chart_start_date)) & 
+                    (filtered_tickets['ticket_date'] <= pd.to_datetime(chart_end_date))
+                ]
+            else:
+                chart_filtered_tickets = filtered_tickets
+            
+            daily_tickets = chart_filtered_tickets.groupby('ticket_date').size().reset_index(name='count')
             
             fig1 = px.line(
                 daily_tickets,
@@ -421,6 +484,15 @@ def main():
                 labels={'ticket_date': 'Date', 'count': 'Tickets'}
             )
             fig1.update_traces(mode='lines+markers')
+            
+            # Add range selector buttons and date range selector for interactivity
+            fig1.update_layout(
+                xaxis=dict(
+                    rangeslider=dict(visible=True),
+                    type="date"
+                )
+            )
+            
             fig1.add_annotation(text="Track ticket volume trends. Spikes may indicate service issues or system outages.", 
                                xref="paper", yref="paper", x=0.5, y=1.1, showarrow=False, 
                                font=dict(size=10, color="white"), bgcolor="gray")
@@ -437,9 +509,16 @@ def main():
                 filtered_tickets['status'].isin(['Open', 'In Progress', 'Escalated'])
             ].groupby('zone').size().sort_values(ascending=False).head(10)
             
+            # Create a DataFrame for the backlog data
+            backlog_df = pd.DataFrame({
+                'tickets': backlog_by_zone.values,
+                'zone': backlog_by_zone.index
+            })
+            
             fig2 = px.bar(
-                x=backlog_by_zone.values,
-                y=backlog_by_zone.index,
+                backlog_df,
+                x='tickets',
+                y='zone',
                 orientation='h',
                 title="Ticket Backlog by Zone (Top 10)",
                 labels={'x': 'Open Tickets', 'y': 'Zone'}
